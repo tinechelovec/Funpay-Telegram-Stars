@@ -22,3 +22,4 @@ FRAGMENT_MNEMONICS=ваша_секретная_фраза
 ```
 3. Получить API на [Fragment.](https://fragment-api.com/)
    
+По всем багам, вопросам и предложеням пишите в [Issues](https://github.com/tinechelovec/Funpay-Telegram-Stars/issues) или в [Telegram](https://t.me/tinechelovec)
