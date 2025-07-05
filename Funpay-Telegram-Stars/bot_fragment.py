@@ -11,7 +11,7 @@ from FunPayAPI.updater.events import NewOrderEvent, NewMessageEvent
 
 load_dotenv()
 
-# Настройка логов
+# Логгирование
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -26,15 +26,18 @@ FRAGMENT_API_KEY = os.getenv("FRAGMENT_API_KEY")
 FRAGMENT_PHONE = os.getenv("FRAGMENT_PHONE")
 FRAGMENT_MNEMONICS = os.getenv("FRAGMENT_MNEMONICS")
 
+
 def load_fragment_token():
     if os.path.exists(TOKEN_FILE):
         with open(TOKEN_FILE, "r") as f:
             return json.load(f).get("token")
     return None
 
+
 def save_fragment_token(token):
     with open(TOKEN_FILE, "w") as f:
         json.dump({"token": token}, f)
+
 
 def authenticate_fragment():
     try:
@@ -48,13 +51,14 @@ def authenticate_fragment():
         if res.status_code == 200:
             token = res.json().get("token")
             save_fragment_token(token)
-            logger.info("Успешная авторизация Fragment.")
+            logger.info("✅ Успешная авторизация Fragment.")
             return token
-        logger.error(f"Ошибка авторизации: {res.text}")
+        logger.error(f"❌ Ошибка авторизации Fragment: {res.text}")
         return None
     except Exception as e:
-        logger.error(f"Исключение при авторизации: {e}")
+        logger.error(f"❌ Исключение при авторизации Fragment: {e}")
         return None
+
 
 def direct_send_stars(token, username, quantity):
     try:
@@ -70,11 +74,25 @@ def direct_send_stars(token, username, quantity):
     except Exception as e:
         return False, str(e)
 
-def extract_stars_count(title):
+
+def extract_stars_count(title: str) -> int:
     if not title:
         return 50
-    match = re.search(r"(\d+)\s*зв", title.lower())
-    return int(match.group(1)) if match else 50
+    title = title.lower()
+
+    # ищем число до/после ключевых слов
+    match = re.search(r"(?:зв[её]зд[а-я]*[^0-9]{0,10})?(\d{1,6})(?=\D*(зв|зв[её]зд|⭐|stars?))", title)
+    if not match:
+        match = re.search(r"(\d{1,6})\s*(зв|зв[её]зд|⭐|stars?)", title)
+    if not match:
+        match = re.search(r"(\d{1,6})", title)
+
+    if match:
+        count = int(match.group(1))
+        return max(1, min(count, 1_000_000))
+
+    return 50
+
 
 def refund_order(account, order_id, chat_id):
     try:
@@ -84,31 +102,33 @@ def refund_order(account, order_id, chat_id):
         return True
     except Exception as e:
         logger.error(f"❌ Не удалось вернуть средства за заказ {order_id}: {e}")
-        account.send_message(chat_id, "❌ Не удалось автоматически оформить возврат. Свяжитесь с админом.")
+        account.send_message(chat_id, "❌ Ошибка возврата. Свяжитесь с админом.")
         return False
+
 
 def main():
     global FRAGMENT_TOKEN
     golden_key = os.getenv("FUNPAY_AUTH_TOKEN")
     if not golden_key:
-        logger.error("FUNPAY_AUTH_TOKEN не найден в .env")
+        logger.error("❌ FUNPAY_AUTH_TOKEN не найден в .env")
         return
 
     account = Account(golden_key)
     account.get()
 
     if not account.username:
-        logger.error("Не удалось получить имя пользователя. Проверьте токен.")
+        logger.error("❌ Не удалось получить имя пользователя. Проверьте токен.")
         return
 
-    logger.info(f"Авторизован как {account.username}")
+    logger.info(f"✅ Авторизован как {account.username}")
     runner = Runner(account)
-    logger.info("Бот запущен. Ожидание событий...")
 
     FRAGMENT_TOKEN = load_fragment_token() or authenticate_fragment()
     if not FRAGMENT_TOKEN:
-        logger.error("Не удалось авторизоваться в Fragment.")
+        logger.error("❌ Не удалось авторизоваться в Fragment.")
         return
+
+    logger.info("🤖 Бот запущен. Ожидание событий...")
 
     last_reply_time = 0
 
@@ -120,9 +140,21 @@ def main():
 
             if isinstance(event, NewOrderEvent):
                 order = account.get_order(event.order.id)
+
+                title = getattr(order, "title", None) or getattr(order, "short_description", None) \
+                        or getattr(order, "full_description", None) or ""
+
+                logger.info(f"🔍 order.title (raw): {repr(title)}")
+
+                stars = extract_stars_count(title)
+                if stars == 50 and getattr(order, "amount", None):
+                    stars = order.amount
+
+                logger.info(f"📦 Новый заказ: {title}")
+                logger.info(f"💫 Извлечено звёзд: {stars}")
+
                 buyer_id = order.buyer_id
                 chat_id = order.chat_id
-                stars = extract_stars_count(order.title)
 
                 waiting_for_nick[buyer_id] = {
                     "chat_id": chat_id,
@@ -133,7 +165,7 @@ def main():
                 }
 
                 account.send_message(chat_id, f"Спасибо за покупку!\nПожалуйста, отправьте ваш Telegram-тег (пример: @username), чтобы получить {stars} ⭐.")
-                logger.info(f"Ожидаю тег от покупателя {buyer_id}, чат {chat_id}")
+                logger.info(f"⏳ Ожидаю тег от покупателя {buyer_id}, чат {chat_id}")
                 last_reply_time = now
 
             elif isinstance(event, NewMessageEvent):
@@ -152,20 +184,20 @@ def main():
                 if user_state["state"] == "awaiting_nick":
                     user_state["temp_nick"] = text
                     user_state["state"] = "awaiting_confirmation"
-                    account.send_message(chat_id, f'Вы указали: "{text}". Если это ваш Telegram-тег, напишите "+", иначе отправьте новый тег.')
+                    account.send_message(chat_id, f'Вы указали: "{text}". Если это ваш Telegram-тег, напишите "+", иначе отправьте другой.')
                     last_reply_time = now
 
                 elif user_state["state"] == "awaiting_confirmation":
                     if text == "+":
                         username = user_state["temp_nick"].lstrip("@")
-                        account.send_message(chat_id, f"Отправляю {stars} звёзд пользователю @{username}...")
+                        account.send_message(chat_id, f"🚀 Отправляю {stars} ⭐ пользователю @{username}...")
                         success, response = direct_send_stars(FRAGMENT_TOKEN, username, stars)
 
                         if success:
                             account.send_message(chat_id, f"✅ Успешно отправлено {stars} ⭐ пользователю @{username}!")
-                            logger.info(f"Успешно отправлено @{username}: {stars} звёзд")
+                            logger.info(f"✅ @{username} получил {stars} ⭐")
                         else:
-                            account.send_message(chat_id, f"❌ Ошибка при отправке: {response}\n🔁 Пытаюсь оформить возврат средств...")
+                            account.send_message(chat_id, f"❌ Ошибка при отправке: {response}\n🔁 Пытаюсь оформить возврат...")
                             refund_order(account, order_id, chat_id)
 
                         waiting_for_nick.pop(user_id)
@@ -176,7 +208,13 @@ def main():
                         last_reply_time = now
 
         except Exception as e:
-            logger.error(f"Ошибка обработки события: {e}")
+            logger.error(f"❌ Ошибка обработки события: {e}")
+            try:
+                logger.info(f"📦 Новый заказ: {order.title if order else 'unknown'}")
+                logger.info(f"💫 Извлечено звёзд: {stars if 'stars' in locals() else 'unknown'}")
+            except:
+                pass
+
 
 if __name__ == "__main__":
     main()
