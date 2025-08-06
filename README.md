@@ -24,4 +24,4 @@ FRAGMENT_MNEMONICS=ваша_секретная_фраза
    
 По всем багам, вопросам и предложеням пишите в [Issues](https://github.com/tinechelovec/Funpay-Telegram-Stars/issues) или в [Telegram](https://t.me/tinechelovec)
 
-Другие боты [Channel](https://t.me/by_thc)
+Другие боты и плагины [Channel](https://t.me/by_thc)
