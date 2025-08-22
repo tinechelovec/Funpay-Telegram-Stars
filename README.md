@@ -21,7 +21,9 @@ FRAGMENT_PHONE=ваш_номер_телефона
 FRAGMENT_MNEMONICS=ваша_секретная_фраза
 ```
 3. Получить API на [Fragment.](https://fragment-api.com/)
+
+Более подробная [Инструкция](https://teletype.in/@tinechelovec/Funpay-Telegram-Stars)
    
-По всем багам, вопросам и предложеням пишите в [Issues](https://github.com/tinechelovec/Funpay-Telegram-Stars/issues) или в [Telegram](https://t.me/tinechelovec)
+По всем багам, вопросам и предложениям пишите в [Issues](https://github.com/tinechelovec/Funpay-Telegram-Stars/issues) или в [Telegram](https://t.me/tinechelovec)
 
 Другие боты и плагины [Channel](https://t.me/by_thc)
