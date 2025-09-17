@@ -4,6 +4,8 @@ import time
 import json
 import re
 import requests
+from typing import Optional, Tuple
+
 from dotenv import load_dotenv
 from FunPayAPI import Account
 from FunPayAPI.updater.runner import Runner
@@ -12,15 +14,16 @@ from FunPayAPI.updater.events import NewOrderEvent, NewMessageEvent
 # ============ ENV ============
 load_dotenv()
 
-COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "1"))
+COOLDOWN_SECONDS = float(os.getenv("COOLDOWN_SECONDS", "1"))
 TOKEN_FILE = "auth_token.json"
 FRAGMENT_API_URL = "https://api.fragment-api.com/v1"
-waiting_for_nick = {}
+waiting_for_nick: dict[int, dict] = {}
 
-FRAGMENT_TOKEN = None
+FRAGMENT_TOKEN: Optional[str] = None
 FRAGMENT_API_KEY = os.getenv("FRAGMENT_API_KEY")
 FRAGMENT_PHONE = os.getenv("FRAGMENT_PHONE")
-FRAGMENT_MNEMONICS = os.getenv("FRAGMENT_MNEMONICS")
+FRAGMENT_MNEMONICS = os.getenv("FRAGMENT_MNEMONICS", "")
+FRAGMENT_VERSION = (os.getenv("FRAGMENT_VERSION") or "V4R2").strip().upper()
 
 DEACTIVATE_CATEGORY_ID = 2418
 
@@ -45,17 +48,14 @@ try:
 except Exception:
     FRAGMENT_MIN_BALANCE = 5.0
 
-# ============ COLORFUL LOGGING ============
+# ============ COLORFUL + FILE LOGGING ============
 try:
     from colorama import init as colorama_init, Fore, Style
     colorama_init(autoreset=True)
 except Exception:
-    class _Dummy:
-        RESET_ALL = ""
-    class _Fore(_Dummy):
-        RED = GREEN = YELLOW = CYAN = MAGENTA = BLUE = WHITE = ""
-    class _Style(_Dummy):
-        BRIGHT = NORMAL = ""
+    class _Dummy: RESET_ALL = ""
+    class _Fore(_Dummy): RED = GREEN = YELLOW = CYAN = MAGENTA = BLUE = WHITE = ""
+    class _Style(_Dummy): BRIGHT = NORMAL = ""
     Fore, Style = _Fore(), _Style()
 
 class ColorFormatter(logging.Formatter):
@@ -81,80 +81,158 @@ for h in logging.getLogger().handlers:
     except Exception:
         pass
 
+file_handler = logging.FileHandler("log.txt", encoding="utf-8")
+file_handler.setLevel(logging.INFO)
+file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s:%(lineno)d | %(message)s"))
+logging.getLogger().addHandler(file_handler)
+
 logger = logging.getLogger("StarsBot")
 
+def _excepthook(exc_type, exc, tb):
+    logger.critical("UNHANDLED EXCEPTION", exc_info=(exc_type, exc, tb))
+import sys
+sys.excepthook = _excepthook
+
 # ============ HELPERS ============
-def load_fragment_token():
-    if os.path.exists(TOKEN_FILE):
-        with open(TOKEN_FILE, "r", encoding="utf-8") as f:
-            return json.load(f).get("token")
-    return None
+def _token_file_path() -> str:
+    return TOKEN_FILE
 
-def save_fragment_token(token):
-    with open(TOKEN_FILE, "w", encoding="utf-8") as f:
-        json.dump({"token": token}, f)
-
-def authenticate_fragment():
+def load_fragment_token() -> Optional[str]:
+    p = _token_file_path()
+    if not os.path.exists(p):
+        return None
     try:
-        mnemonics_list = FRAGMENT_MNEMONICS.strip().split()
+        with open(p, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return None
+        token = data.get("token")
+        saved_ver = (data.get("version") or "").strip().upper()
+        if token and saved_ver and saved_ver != FRAGMENT_VERSION:
+            logger.warning(Fore.YELLOW + f"[TOKEN] Версия токена {saved_ver} != текущей {FRAGMENT_VERSION}. "
+                                         f"Пробую с кэшем; при 401/403 выполню переавторизацию.")
+        return token
+    except Exception as e:
+        logger.debug(f"Не удалось прочитать {p}: {e}")
+        return None
+
+def save_fragment_token(token: str):
+    p = _token_file_path()
+    try:
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump({"token": token, "version": FRAGMENT_VERSION, "ts": int(time.time())}, f, ensure_ascii=False)
+    except Exception as e:
+        logger.warning(f"Не удалось сохранить токен в {p}: {e}")
+
+def authenticate_fragment() -> Optional[str]:
+    try:
+        mnemonics_list = [w for w in FRAGMENT_MNEMONICS.strip().split() if w]
         payload = {
             "api_key": FRAGMENT_API_KEY,
             "phone_number": FRAGMENT_PHONE,
+            "version": FRAGMENT_VERSION,
             "mnemonics": mnemonics_list
         }
-        res = requests.post(f"{FRAGMENT_API_URL}/auth/authenticate/", json=payload, timeout=10)
+        res = requests.post(f"{FRAGMENT_API_URL}/auth/authenticate/", json=payload, timeout=60)
         if res.status_code == 200:
             token = res.json().get("token")
             save_fragment_token(token)
-            logger.info(Fore.GREEN + "✅ Успешная авторизация Fragment.")
+            logger.info(Fore.GREEN + f"✅ Успешная авторизация Fragment (version={FRAGMENT_VERSION}).")
             return token
-        logger.error(Fore.RED + f"❌ Ошибка авторизации Fragment: {res.status_code} {res.text}")
+        logger.error(Fore.RED + f"❌ Ошибка авторизации Fragment [{res.status_code}]: {res.text}")
         return None
     except Exception as e:
         logger.exception(Fore.RED + f"❌ Исключение при авторизации Fragment: {e}")
         return None
 
-def check_username_exists(username):
+def fragment_request(method: str, path: str, retry_on_auth: bool = True, **kwargs) -> requests.Response:
     global FRAGMENT_TOKEN
-    url = f"{FRAGMENT_API_URL}/misc/user/{username.lstrip('@')}/"
-    headers = {"Accept": "application/json", "Authorization": f"JWT {FRAGMENT_TOKEN}"}
+    url = f"{FRAGMENT_API_URL}{path}"
+    headers = kwargs.pop("headers", {}) or {}
+    headers.setdefault("Accept", "application/json")
+    if "json" in kwargs:
+        headers.setdefault("Content-Type", "application/json")
+    if FRAGMENT_TOKEN:
+        headers["Authorization"] = f"JWT {FRAGMENT_TOKEN}"
+    timeout = kwargs.pop("timeout", 10)
+
     try:
-        res = requests.get(url, headers=headers, timeout=8)
-        return res.status_code == 200 and isinstance(res.json(), dict) and "username" in res.json()
+        r = requests.request(method, url, headers=headers, timeout=timeout, **kwargs)
+        if r.status_code in (401, 403) and retry_on_auth:
+            logger.info(Fore.YELLOW + "🔑 Токен недействителен. Переавторизация…")
+            FRAGMENT_TOKEN = authenticate_fragment()
+            if FRAGMENT_TOKEN:
+                headers["Authorization"] = f"JWT {FRAGMENT_TOKEN}"
+                r = requests.request(method, url, headers=headers, timeout=timeout, **kwargs)
+        return r
     except Exception as e:
-        logger.error(Fore.RED + f"❌ Ошибка при проверке ника: {e}")
+        logger.error(Fore.RED + f"❌ Ошибка HTTP-запроса к Fragment {method} {path}: {e}")
+        raise
+
+def check_username_exists(username: str) -> bool:
+    uname = username.lstrip('@').strip()
+    try:
+        r = fragment_request("GET", f"/misc/user/{uname}/", timeout=8)
+        ok = (r.status_code == 200 and isinstance(r.json(), dict) and "username" in r.json())
+        if not ok:
+            logger.info(f"[USERCHECK] {uname}: HTTP {r.status_code} | {r.text[:500]}")
+        return ok
+    except Exception as e:
+        logger.error(Fore.RED + f"❌ Ошибка при проверке ника @{uname}: {e}")
         return False
 
-def direct_send_stars(token, username, quantity):
+def direct_send_stars(username: str, quantity: int) -> Tuple[bool, str, int]:
+    data = {"username": username, "quantity": quantity}
     try:
-        data = {"username": username, "quantity": quantity}
-        headers = {"Authorization": f"JWT {token}", "Content-Type": "application/json"}
-        res = requests.post(f"{FRAGMENT_API_URL}/order/stars/", json=data, headers=headers, timeout=60)
-        if res.status_code == 200:
-            return True, res.text
-        return False, res.text
+        r = fragment_request("POST", "/order/stars/", json=data, timeout=60)
+        return (r.status_code == 200, r.text, r.status_code)
     except Exception as e:
-        return False, str(e)
+        return (False, str(e), 0)
 
-def parse_fragment_error(response_text):
+def parse_fragment_error(response_text: str, status_code: int = 0) -> str:
+    fallback = "Ошибка обработки заказа."
     try:
         data = json.loads(response_text)
     except Exception:
-        return "Неизвестная ошибка."
+        data = None
+
+    if status_code == 429:
+        return "Слишком много запросов. Попробуйте ещё раз через минуту."
+    if status_code in (500, 502, 503, 504):
+        return "Сервис Fragment временно недоступен. Повторите позже."
+    if status_code in (401, 403):
+        return "Нужна повторная авторизация. Попробуйте ещё раз (мы уже переавторизуемся)."
 
     if isinstance(data, dict):
         if "username" in data:
-            return "Неверный Telegram-тег"
+            return "Неверный Telegram-тег (проверьте @username)."
         if "quantity" in data:
-            return "Минимум 50 ⭐ для покупки"
-        if "errors" in data:
-            for err in data["errors"]:
-                if "Not enough funds" in err.get("error", "") or "Not enough balance" in err.get("error", ""):
-                    return "Недостаточно средств"
-    if isinstance(data, list):
+            return "Минимальное количество для покупки — 50 ⭐."
+        for k in ("detail", "message", "error"):
+            if data.get(k):
+                msg = str(data[k])
+                if "Not enough" in msg or "balance" in msg.lower():
+                    return "Недостаточно средств на кошельке Fragment."
+                if "version" in msg.lower():
+                    return "Неверная версия кошелька. Проверьте FRAGMENT_VERSION."
+                if "username" in msg.lower():
+                    return "Пользователь с таким @username не найден."
+                return msg[:200]
+        if isinstance(data.get("errors"), list):
+            joined = " | ".join(str(x.get("error") or x) for x in data["errors"][:3])
+            if "balance" in joined.lower():
+                return "Недостаточно средств на кошельке Fragment."
+            return (joined or fallback)[:200]
+        if isinstance(data.get("data"), dict):
+            inner = data["data"]
+            for k in ("error", "message", "detail"):
+                if inner.get(k):
+                    return str(inner[k])[:200]
+    elif isinstance(data, list) and data:
         txt = " | ".join(str(x) for x in data[:3])
-        return txt[:200] or "Неизвестная ошибка."
-    return "Ошибка обработки заказа"
+        return txt[:200]
+
+    return fallback
 
 def extract_stars_count(title: str, description: str = "") -> int:
     text = f"{title or ''} {description or ''}".lower()
@@ -181,8 +259,8 @@ def refund_order(account, order_id, chat_id, reason: str = ""):
             account.send_message(chat_id, "❌ Ошибка возврата. Свяжитесь с админом.")
         return False
 
-def log_order_api_error(order_id, api_response, short_error):
-    logger.error(Fore.RED + f"{order_id} | {str(api_response)[:800]} | {short_error}")
+def log_order_api_error(order_id, api_response_text, short_error, status_code: int = 0):
+    logger.error(Fore.RED + f"{order_id} | HTTP {status_code} | {str(api_response_text)[:800]} | {short_error}")
 
 def get_subcategory_id_safe(order, account):
     subcat = getattr(order, "subcategory", None) or getattr(order, "sub_category", None)
@@ -197,20 +275,13 @@ def get_subcategory_id_safe(order, account):
         logger.warning(f"⚠️ Не удалось загрузить полный заказ: {e}")
     return None, None
 
-def check_fragment_balance() -> float | None:
-    global FRAGMENT_TOKEN
-    if not FRAGMENT_TOKEN:
-        return None
-    url = f"{FRAGMENT_API_URL}/misc/wallet/"
-    headers = {"Accept": "application/json", "Authorization": f"JWT {FRAGMENT_TOKEN}"}
+def check_fragment_balance() -> Optional[float]:
     try:
-        r = requests.get(url, headers=headers, timeout=8)
-    except Exception as e:
-        logger.error(Fore.RED + f"[BALANCE] Ошибка запроса баланса Fragment: {e}")
+        r = fragment_request("GET", "/misc/wallet/", timeout=8)
+    except Exception:
         return None
 
-    logger.debug(Fore.CYAN + f"[BALANCE] HTTP {r.status_code} от {url} | body: {r.text[:1000]}")
-
+    logger.debug(Fore.CYAN + f"[BALANCE] HTTP {r.status_code} | body: {r.text[:1000]}")
     if r.status_code != 200:
         logger.warning(Fore.YELLOW + f"[BALANCE] Некорректный ответ {r.status_code} при запросе баланса Fragment")
         return None
@@ -303,10 +374,7 @@ def deactivate_category(account: Account, category_id: int):
 
         try:
             if isinstance(field, dict):
-                if field.get("active") in (True, "true", "True", 1):
-                    field["active"] = False
-                else:
-                    field["active"] = False
+                field["active"] = False
             else:
                 try:
                     setattr(field, "active", False)
@@ -353,6 +421,9 @@ def main():
         logger.error(Fore.RED + "❌ FUNPAY_AUTH_TOKEN не найден в .env")
         return
 
+    if FRAGMENT_VERSION not in ("V4R2", "W5"):
+        logger.warning(Fore.YELLOW + f"⚠️ Неизвестная FRAGMENT_VERSION={FRAGMENT_VERSION}. Разрешены: V4R2, W5.")
+
     account = Account(golden_key)
     account.get()
 
@@ -364,7 +435,9 @@ def main():
         logger.warning(Fore.YELLOW + f"⚠️ FRAGMENT_MIN_BALANCE не задан в .env. Используется дефолт {FRAGMENT_MIN_BALANCE}")
 
     logger.info(Fore.GREEN + f"🔐 Авторизован как {getattr(account, 'username', '(unknown)')}")
-    logger.info(Fore.CYAN + f"Настройки: AUTO_REFUND={AUTO_REFUND}, AUTO_DEACTIVATE={AUTO_DEACTIVATE}, FRAGMENT_MIN_BALANCE={FRAGMENT_MIN_BALANCE}, DEACTIVATE_CATEGORY_ID={DEACTIVATE_CATEGORY_ID}")
+    logger.info(Fore.CYAN + f"Настройки: AUTO_REFUND={AUTO_REFUND}, AUTO_DEACTIVATE={AUTO_DEACTIVATE}, "
+                            f"FRAGMENT_MIN_BALANCE={FRAGMENT_MIN_BALANCE}, DEACTIVATE_CATEGORY_ID={DEACTIVATE_CATEGORY_ID}, "
+                            f"FRAGMENT_VERSION={FRAGMENT_VERSION}")
 
     runner = Runner(account)
 
@@ -375,7 +448,7 @@ def main():
 
     logger.info(Style.BRIGHT + Fore.WHITE + "🚀 StarsBot запущен. Ожидание событий...")
 
-    last_reply_time = 0
+    last_reply_time = 0.0
 
     for event in runner.listen(requests_delay=3.0):
         try:
@@ -402,7 +475,15 @@ def main():
 
                 buyer_id, chat_id = order.buyer_id, order.chat_id
                 waiting_for_nick[buyer_id] = {"chat_id": chat_id, "stars": stars, "order_id": order.id, "state": "awaiting_nick", "temp_nick": None}
-                account.send_message(chat_id, f"Спасибо за покупку!\nПожалуйста, отправьте ваш Telegram-тег (пример: @username), чтобы получить {stars} ⭐.")
+                msg_after_purchase = f"""🎉 Спасибо за покупку!
+
+                К выдаче: {stars} звезд⭐
+
+                Пожалуйста, пришлите ваш Telegram-тег в формате @username.
+                Если не знаете свой тег: откройте профиль Telegram → «Имя пользователя».
+
+                После отправки тега я попрошу вас его подтвердить."""
+                account.send_message(chat_id, msg_after_purchase)
                 last_reply_time = now
 
             elif isinstance(event, NewMessageEvent):
@@ -422,23 +503,33 @@ def main():
                     else:
                         user_state["temp_nick"] = text
                         user_state["state"] = "awaiting_confirmation"
-                        account.send_message(chat_id, f'Вы указали: "{text}". Если это ваш Telegram-тег, напишите "+", иначе отправьте другой.')
+                        account.send_message(
+                            chat_id,
+                            f"⁡Вы указали: {text}.\nЕсли верно — отправьте +.\nЕсли нужно изменить — пришлите другой тег в формате @username."
+                        )
                         last_reply_time = now
 
                 elif user_state["state"] == "awaiting_confirmation":
                     if text == "+":
                         username = user_state["temp_nick"].lstrip("@")
                         account.send_message(chat_id, f"🚀 Отправляю {stars} ⭐ пользователю @{username}...")
-                        success, response = direct_send_stars(FRAGMENT_TOKEN, username, stars)
+                        success, response, status_code = direct_send_stars(username, stars)
                         if success:
                             account.send_message(chat_id, f"✅ Успешно отправлено {stars} ⭐ пользователю @{username}!")
                             logger.info(Fore.GREEN + f"✅ @{username} получил {stars} ⭐ (order {order_id})")
+
+                            order_url = f"https://funpay.com/orders/{order_id}/"
+                            account.send_message(
+                                chat_id,
+                                "🙏 Пожалуйста, подтвердите выполнение заказа и оставьте отзыв — это очень помогает!\n"
+                                f"Ссылка на заказ: {order_url}"
+                            )
                         else:
-                            short_error = parse_fragment_error(response)
-                            log_order_api_error(order_id, response, short_error)
+                            short_error = parse_fragment_error(response, status_code=status_code)
+                            log_order_api_error(order_id, response, short_error, status_code=status_code)
 
                             if AUTO_REFUND:
-                                account.send_message(chat_id, short_error + "\n🔁 Пытаюсь оформить возврат...")
+                                account.send_message(chat_id, short_error + "\n🔁 Пытаюсь оформить возврат…")
                                 refunded = refund_order(account, order_id, chat_id, reason=short_error)
                                 if not refunded:
                                     notify_text = f"Не удалось автоматически вернуть средства по заказу {order_id}. Причина: {short_error}"
@@ -461,12 +552,16 @@ def main():
                                 logger.warning(Fore.YELLOW + "[BALANCE] Не удалось определить баланс Fragment (endpoint /misc/wallet/ вернул некорректный формат).")
 
                         waiting_for_nick.pop(user_id, None)
+                        last_reply_time = now
                     else:
                         if not check_username_exists(text):
                             account.send_message(chat_id, f'❌ Ник "{text}" не найден. Пожалуйста, введите правильный Telegram-тег.')
                         else:
                             user_state["temp_nick"] = text
-                            account.send_message(chat_id, f'Вы указали: "{text}". Если это ваш Telegram-тег, напишите "+".')
+                            account.send_message(
+                                chat_id,
+                                f"⁡Вы указали: {text}.\nЕсли верно — отправьте +.\nЕсли нужно изменить — пришлите другой тег в формате @username."
+                            )
                         last_reply_time = now
 
         except Exception as e:
